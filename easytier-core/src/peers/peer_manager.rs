@@ -966,7 +966,8 @@ impl PeerManagerCore {
         let stats_manager = core_context.stats_manager();
         let acl_filter = Arc::new(AclFilter::new());
         let context: ArcPeerContext = core_context.clone();
-        let (packet_send, packet_recv) = super::create_packet_recv_chan();
+        let (packet_send, packet_recv) =
+            super::create_packet_recv_chan_with_capacity(super::MAIN_PEER_PACKET_CHAN_CAPACITY);
         let peers = Arc::new(PeerMap::new(
             packet_send.clone(),
             context.clone(),

@@ -1,0 +1,51 @@
+name: Build Linux x86_64 (own-network starvation fix)
+
+# Minimal build of easytier-core / easytier-cli for x86_64 Linux (static musl),
+# used to test the fix on a public node without running the full core.yml matrix.
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "fix/own-network-starvation" ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET: x86_64-unknown-linux-musl
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Prepare build environment
+        uses: ./.github/actions/prepare-build
+        with:
+          target: x86_64-unknown-linux-musl
+          gui: false
+          pnpm: false
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: fix-linux-x86_64
+          cache-targets: "true"
+
+      - name: Build
+        run: cargo build --release --target $TARGET --package=easytier --features=jemalloc
+
+      - name: Collect binaries
+        run: |
+          mkdir -p out
+          cp target/$TARGET/release/easytier-core target/$TARGET/release/easytier-cli out/
+          ./out/easytier-core --version | tee out/VERSION
+          sha256sum out/easytier-core out/easytier-cli | tee out/SHA256SUMS
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: easytier-linux-x86_64-${{ github.sha }}
+          path: out/
+          if-no-files-found: error

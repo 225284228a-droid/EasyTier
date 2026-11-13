@@ -1579,6 +1579,15 @@ impl ForeignNetworkPacketRouter {
                         }
                     }
                     _ => {
+                        // No route inside this foreign network. Data for an unknown
+                        // peer (typically one that just disconnected) cannot be
+                        // delivered by the parent either, and on a busy public node
+                        // it would flood the shared parent queue. Control packets
+                        // are still handed over for cross-server relaying.
+                        if gateway_peer_id.is_none() && is_relay_data_packet_type(packet_type) {
+                            crate::peers::PEER_CHAN_DROP_STATS.inc_foreign_forward_no_route();
+                            continue;
+                        }
                         let mut foreign_packet = ZCPacket::new_for_foreign_network(
                             &network_name,
                             to_peer_id,
@@ -1590,8 +1599,20 @@ impl ForeignNetworkPacketRouter {
                             via_peer,
                             PacketType::ForeignNetworkPacket as u8,
                         );
-                        if let Err(e) = pm_sender.send(foreign_packet).await {
-                            tracing::error!("send packet to peer with pm failed: {:?}", e);
+                        // Never block this foreign network's router on the parent
+                        // queue: drop when it is full.
+                        if let Err(e) = pm_sender.try_send(foreign_packet) {
+                            match e {
+                                tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                                    crate::peers::PEER_CHAN_DROP_STATS
+                                        .inc_foreign_forward_queue_full();
+                                }
+                                tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                                    tracing::error!(
+                                        "send packet to peer with pm failed: channel closed"
+                                    );
+                                }
+                            }
                         } else if is_locally_originated {
                             traffic_metrics
                                 .record_tx(to_peer_id, packet_type, buf_len as u64)

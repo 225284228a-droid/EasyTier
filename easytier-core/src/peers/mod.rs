@@ -22,10 +22,83 @@ pub(crate) mod test_support;
 mod tests;
 
 use crate::packet::ZCPacket;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc::error::{SendError, TryRecvError, TrySendError};
 
 use self::conn::peer_conn::PeerConnId;
 use crate::config::PeerId;
+
+/// Capacity of the channel feeding the main peer manager. Every own-network
+/// connection and every foreign network that hands packets back to the parent
+/// shares this one queue, so it gets more headroom than per-network queues.
+pub(crate) const MAIN_PEER_PACKET_CHAN_CAPACITY: usize = 2048;
+
+/// Packets dropped instead of blocking a producer on a full peer packet queue.
+///
+/// Blocking used to stall the per-connection receive loop (no ping/pong or RPC
+/// processing for that connection) and the per-foreign-network router whenever
+/// the peer manager fell behind. Relay data is dropped instead; control traffic
+/// still waits. Totals are logged at most every `LOG_INTERVAL_SECS`.
+pub(crate) struct PeerChanDropStats {
+    conn_data_queue_full: AtomicU64,
+    foreign_forward_queue_full: AtomicU64,
+    foreign_forward_no_route: AtomicU64,
+    last_log_secs: AtomicU64,
+}
+
+impl PeerChanDropStats {
+    const LOG_INTERVAL_SECS: u64 = 10;
+
+    const fn new() -> Self {
+        Self {
+            conn_data_queue_full: AtomicU64::new(0),
+            foreign_forward_queue_full: AtomicU64::new(0),
+            foreign_forward_no_route: AtomicU64::new(0),
+            last_log_secs: AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn inc_conn_data_queue_full(&self) {
+        self.conn_data_queue_full.fetch_add(1, Ordering::Relaxed);
+        self.maybe_log();
+    }
+
+    pub(crate) fn inc_foreign_forward_queue_full(&self) {
+        self.foreign_forward_queue_full
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_log();
+    }
+
+    pub(crate) fn inc_foreign_forward_no_route(&self) {
+        self.foreign_forward_no_route
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_log();
+    }
+
+    fn maybe_log(&self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let last = self.last_log_secs.load(Ordering::Relaxed);
+        if now < last + Self::LOG_INTERVAL_SECS
+            || self
+                .last_log_secs
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
+            return;
+        }
+        tracing::warn!(
+            conn_data_queue_full = self.conn_data_queue_full.load(Ordering::Relaxed),
+            foreign_forward_queue_full = self.foreign_forward_queue_full.load(Ordering::Relaxed),
+            foreign_forward_no_route = self.foreign_forward_no_route.load(Ordering::Relaxed),
+            "peer packet queue drops (cumulative)"
+        );
+    }
+}
+
+pub(crate) static PEER_CHAN_DROP_STATS: PeerChanDropStats = PeerChanDropStats::new();
 
 /// The local entry point that created a peer connection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -105,6 +178,17 @@ impl PacketRecvChan {
             .await
             .map_err(|error| SendError(error.0.packet))
     }
+
+    /// Non-blocking variant of [`Self::send`] for producers that must never be
+    /// held up by a slow consumer.
+    pub(crate) fn try_send(&self, packet: ZCPacket) -> Result<(), TrySendError<ZCPacket>> {
+        self.0
+            .try_send(PeerPacketEnvelope::local(packet))
+            .map_err(|error| match error {
+                TrySendError::Full(envelope) => TrySendError::Full(envelope.packet),
+                TrySendError::Closed(envelope) => TrySendError::Closed(envelope.packet),
+            })
+    }
 }
 
 pub struct PacketRecvChanReceiver(tokio::sync::mpsc::Receiver<PeerPacketEnvelope>);
@@ -116,10 +200,23 @@ impl PacketRecvChanReceiver {
 }
 
 pub fn create_packet_recv_chan() -> (PacketRecvChan, PacketRecvChanReceiver) {
-    let (sender, receiver) = tokio::sync::mpsc::channel(128);
+    create_packet_recv_chan_with_capacity(128)
+}
+
+pub(crate) fn create_packet_recv_chan_with_capacity(
+    capacity: usize,
+) -> (PacketRecvChan, PacketRecvChanReceiver) {
+    let (sender, receiver) = tokio::sync::mpsc::channel(capacity);
     (PacketRecvChan(sender), PacketRecvChanReceiver(receiver))
 }
 
+/// Hands a packet received on a peer connection to its peer manager.
+///
+/// When the queue is full, relay data is dropped (the tunnelled protocols
+/// recover from loss) so the connection's receive loop keeps running and keeps
+/// answering pings and RPCs. Control packets still wait for room; waiting
+/// senders get freed slots before `try_send` callers, so they are not starved
+/// by data traffic.
 pub(crate) async fn send_peer_packet_to_chan(
     sender: &PacketRecvChan,
     packet: ZCPacket,
@@ -128,11 +225,17 @@ pub(crate) async fn send_peer_packet_to_chan(
     let envelope = PeerPacketEnvelope::from_peer(packet, ingress);
     match sender.0.try_send(envelope) {
         Ok(()) => Ok(()),
-        Err(TrySendError::Full(envelope)) => sender
-            .0
-            .send(envelope)
-            .await
-            .map_err(|error| SendError(error.0.packet)),
+        Err(TrySendError::Full(envelope)) => {
+            if peer_manager::is_relay_data_zc_packet(&envelope.packet) {
+                PEER_CHAN_DROP_STATS.inc_conn_data_queue_full();
+                return Ok(());
+            }
+            sender
+                .0
+                .send(envelope)
+                .await
+                .map_err(|error| SendError(error.0.packet))
+        }
         Err(TrySendError::Closed(envelope)) => Err(SendError(envelope.packet)),
     }
 }
