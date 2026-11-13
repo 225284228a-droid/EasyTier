@@ -2,6 +2,10 @@ name: Build Linux x86_64 (own-network starvation fix)
 
 # Minimal build of easytier-core / easytier-cli for x86_64 Linux (static musl),
 # used to test the fix on a public node without running the full core.yml matrix.
+#
+# This fork only allows actions from repositories it owns, so the job uses no
+# `uses:` steps at all: plain git, apt, rustup and the runner's gh CLI. The
+# binaries are published as a pre-release named build-<short sha>.
 on:
   workflow_dispatch:
   push:
@@ -11,41 +15,59 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: write
+
 env:
   CARGO_TERM_COLOR: always
   TARGET: x86_64-unknown-linux-musl
+  PROTOC_VERSION: "35.1"
 
 jobs:
   build:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - name: Checkout
+        run: |
+          git init -q src
+          cd src
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git fetch -q --depth 1 origin "$GITHUB_SHA"
+          git checkout -q FETCH_HEAD
+          git log -1 --format='%h %s'
 
-      - name: Prepare build environment
-        uses: ./.github/actions/prepare-build
-        with:
-          target: x86_64-unknown-linux-musl
-          gui: false
-          pnpm: false
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -qqy build-essential mold musl-tools unzip
+          curl -fsSL -o /tmp/protoc.zip \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+          sudo unzip -q -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
+          protoc --version
 
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: fix-linux-x86_64
-          cache-targets: "true"
+      - name: Install Rust toolchain
+        working-directory: src
+        run: |
+          rustup show active-toolchain || rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" --profile minimal
+          rustup target add "$TARGET"
+          rustc --version
 
       - name: Build
-        run: cargo build --release --target $TARGET --package=easytier --features=jemalloc
+        working-directory: src
+        run: cargo build --release --target "$TARGET" --package=easytier --features=jemalloc
 
-      - name: Collect binaries
+      - name: Publish binaries
+        working-directory: src
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p out
-          cp target/$TARGET/release/easytier-core target/$TARGET/release/easytier-cli out/
+          cp "target/$TARGET/release/easytier-core" "target/$TARGET/release/easytier-cli" out/
           ./out/easytier-core --version | tee out/VERSION
-          sha256sum out/easytier-core out/easytier-cli | tee out/SHA256SUMS
-
-      - uses: actions/upload-artifact@v5
-        with:
-          name: easytier-linux-x86_64-${{ github.sha }}
-          path: out/
-          if-no-files-found: error
+          (cd out && sha256sum easytier-core easytier-cli | tee SHA256SUMS)
+          TAG="build-${GITHUB_SHA::8}"
+          gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease \
+            --title "$TAG (x86_64-unknown-linux-musl)" \
+            --notes "Test build of ${GITHUB_REF_NAME} @ ${GITHUB_SHA}. Not an official release." \
+            out/easytier-core out/easytier-cli out/VERSION out/SHA256SUMS
